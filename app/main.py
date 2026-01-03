@@ -1,7 +1,6 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote
-from pathlib import Path
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
@@ -22,17 +21,9 @@ from .services import (
     meta_from_json,
 )
 
-# === paths robustos (local + deploy) ===
-APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
-TEMPLATES_DIR = APP_DIR / "templates"
-
-# cria tabelas (MVP)
-ensure_db_ready()
-
 app = FastAPI(title="Trip Planner")
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
 
 CATEGORY_LABEL = {
     "activity": "Passeios",
@@ -45,11 +36,21 @@ CATEGORY_LABEL = {
     "notes": "Anotações",
 }
 
+
+@app.on_event("startup")
+def _startup():
+    # garante DB pronto no Render/Supabase
+    ensure_db_ready(max_wait_seconds=40)
+    # cria tabelas (para projeto simples, sem migrations)
+    Base.metadata.create_all(bind=engine)
+
+
 def parse_yyyy_mm_dd(value: str, field: str):
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except Exception:
         raise HTTPException(status_code=400, detail=f"Data inválida em {field}. Use YYYY-MM-DD.")
+
 
 def parse_money_to_float(value: str):
     if value is None:
@@ -74,6 +75,7 @@ def parse_money_to_float(value: str):
     except Exception:
         raise ValueError("Valor inválido. Use apenas números (ex: 120 ou 120,50).")
 
+
 def build_google_calendar_link(title: str, destination: str, start_date, end_date, details_url: str):
     dates = f"{start_date.strftime('%Y%m%d')}/{end_date.strftime('%Y%m%d')}"
     params = {
@@ -84,8 +86,10 @@ def build_google_calendar_link(title: str, destination: str, start_date, end_dat
     }
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
+
 def redirect_with_error(token: str, msg: str):
     return RedirectResponse(url=f"/t/{token}?error={quote(msg)}", status_code=303)
+
 
 def enforce_date_in_trip(trip, dt, label: str):
     if dt is None:
@@ -96,9 +100,11 @@ def enforce_date_in_trip(trip, dt, label: str):
             detail=f"{label} fora do período da viagem ({trip.start_date} → {trip.end_date}).",
         )
 
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return RedirectResponse(url="/t/new", status_code=302)
+
 
 @app.get("/t/new", response_class=HTMLResponse)
 def trip_new_page(request: Request):
@@ -122,6 +128,7 @@ def trip_new_page(request: Request):
             "error": None,
         },
     )
+
 
 @app.post("/t/new")
 def trip_create_submit(
@@ -185,6 +192,7 @@ def trip_create_submit(
             status_code=e.status_code,
         )
 
+
 @app.get("/t/{token}", response_class=HTMLResponse)
 def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
     trip = get_trip_by_token(db, token)
@@ -212,6 +220,7 @@ def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
     for cat in list(groups.keys()):
         groups[cat].sort(key=lambda x: (x.item_date is None, x.item_date, x.created_at))
 
+    # por dia (apenas activities para o painel premium)
     by_day = defaultdict(list)
     for it in groups.get("activity", []):
         if it.item_date:
@@ -245,6 +254,7 @@ def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
         },
     )
 
+
 @app.post("/t/{token}/edit")
 def edit_trip(
     token: str,
@@ -274,6 +284,7 @@ def edit_trip(
     except HTTPException as e:
         return redirect_with_error(token, str(e.detail))
 
+
 @app.post("/t/{token}/join")
 def join_trip(token: str, name: str = Form(...), email: str = Form(""), db: Session = Depends(get_db)):
     trip = get_trip_by_token(db, token)
@@ -283,6 +294,7 @@ def join_trip(token: str, name: str = Form(...), email: str = Form(""), db: Sess
     add_participant(db, trip, payload)
     return RedirectResponse(url=f"/t/{token}", status_code=303)
 
+
 @app.post("/t/{token}/participants/{participant_id}/delete")
 def delete_participant(token: str, participant_id: int, db: Session = Depends(get_db)):
     trip = get_trip_by_token(db, token)
@@ -290,6 +302,7 @@ def delete_participant(token: str, participant_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
     remove_participant(db, trip, participant_id)
     return RedirectResponse(url=f"/t/{token}", status_code=303)
+
 
 @app.post("/t/{token}/items")
 def add_item(
@@ -301,37 +314,43 @@ def add_item(
     url: str = Form(""),
     cost: str = Form(""),
 
-    place: str = Form(""),
+    # campos genéricos usados por várias categorias
     address: str = Form(""),
-    time_str: str = Form(""),
-
-    needs_ticket: str = Form(""),
-    ticket_url: str = Form(""),
-    ticket_cost: str = Form(""),
-    needs_transport: str = Form(""),
-    transport_url: str = Form(""),
-    transport_cost: str = Form(""),
-    uber_flag: str = Form(""),
-    walk_flag: str = Form(""),
     notes: str = Form(""),
 
+    # activity
+    period: str = Form(""),
+    is_free: str = Form(""),
+    ticket_url: str = Form(""),
+
+    # flight
+    time_str: str = Form(""),
+    company: str = Form(""),
     origin: str = Form(""),
     destination: str = Form(""),
     flight_duration: str = Form(""),
     has_connection: str = Form(""),
     connection_place: str = Form(""),
     connection_duration: str = Form(""),
-    company: str = Form(""),
 
+    # hotel
+    checkin_date: str = Form(""),
+    hotel_type: str = Form(""),
     nights: str = Form(""),
     daily_value: str = Form(""),
 
+    # restaurant
+    planned_date: str = Form(""),
+    meal_type: str = Form(""),
+
+    # transport
     transport_type: str = Form(""),
+    transport_date: str = Form(""),
     transport_duration: str = Form(""),
-    transport_link: str = Form(""),
     is_car_rental: str = Form(""),
     car_daily: str = Form(""),
     car_days: str = Form(""),
+    transport_link: str = Form(""),
 
     db: Session = Depends(get_db),
 ):
@@ -339,14 +358,24 @@ def add_item(
     if not trip:
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
 
+    # --- Data (cada categoria pode mandar em campo diferente)
+    date_raw = (item_date or "").strip()
+    if category == "hotel" and checkin_date.strip():
+        date_raw = checkin_date.strip()
+    if category == "restaurant" and planned_date.strip():
+        date_raw = planned_date.strip()
+    if category == "transport" and transport_date.strip():
+        date_raw = transport_date.strip()
+
     parsed_item_date = None
-    if item_date.strip():
+    if date_raw:
         try:
-            parsed_item_date = parse_yyyy_mm_dd(item_date.strip(), "Data")
+            parsed_item_date = parse_yyyy_mm_dd(date_raw, "Data")
             enforce_date_in_trip(trip, parsed_item_date, "Data")
         except HTTPException as e:
             return redirect_with_error(token, str(e.detail))
 
+    # --- Custo (float) -> centavos no service
     parsed_cost = None
     if cost.strip():
         try:
@@ -356,43 +385,36 @@ def add_item(
 
     meta = {}
 
-    # comuns
+    # campos gerais
     if address.strip():
         meta["address"] = address.strip()
-    if time_str.strip():
-        meta["time"] = time_str.strip()
     if notes.strip():
         meta["notes"] = notes.strip()
+    if url.strip():
+        meta["url"] = url.strip()
 
-    # activity (passeios)
+    # --- activity
     if category == "activity":
-        meta["needs_ticket"] = bool(needs_ticket)
+        if period.strip():
+            meta["period"] = period.strip()
+        meta["is_free"] = bool(is_free)
         if ticket_url.strip():
             meta["ticket_url"] = ticket_url.strip()
-        if ticket_cost.strip():
-            try:
-                meta["ticket_cost"] = parse_money_to_float(ticket_cost)
-            except ValueError as ve:
-                return redirect_with_error(token, f"Ingresso: {ve}")
-        meta["needs_transport"] = bool(needs_transport)
-        if transport_url.strip():
-            meta["transport_url"] = transport_url.strip()
-        if transport_cost.strip():
-            try:
-                meta["transport_cost"] = parse_money_to_float(transport_cost)
-            except ValueError as ve:
-                return redirect_with_error(token, f"Transporte: {ve}")
-        meta["uber"] = bool(uber_flag)
-        meta["walk"] = bool(walk_flag)
 
-    # flight
+        # se for gratuito, zera custo
+        if meta.get("is_free"):
+            parsed_cost = None
+
+    # --- flight
     if category == "flight":
+        if time_str.strip():
+            meta["time"] = time_str.strip()
+        if company.strip():
+            meta["company"] = company.strip()
         if origin.strip():
             meta["origin"] = origin.strip()
         if destination.strip():
             meta["destination"] = destination.strip()
-        if company.strip():
-            meta["company"] = company.strip()
         if flight_duration.strip():
             meta["duration"] = flight_duration.strip()
         meta["has_connection"] = bool(has_connection)
@@ -401,14 +423,29 @@ def add_item(
         if connection_duration.strip():
             meta["connection_duration"] = connection_duration.strip()
 
-    # hotel
+    # --- hotel
     if category == "hotel":
+        if hotel_type.strip():
+            meta["hotel_type"] = hotel_type.strip()
         if nights.strip():
             meta["nights"] = nights.strip()
         if daily_value.strip():
             meta["daily_value"] = daily_value.strip()
+        # cálculo do custo total (noites * diária) se o usuário não informou cost
+        if (not cost.strip()) and nights.strip() and daily_value.strip():
+            try:
+                n = int(nights.strip())
+                dv = parse_money_to_float(daily_value.strip()) or 0.0
+                parsed_cost = float(n * dv)
+            except Exception:
+                pass
 
-    # transport
+    # --- restaurant
+    if category == "restaurant":
+        if meal_type.strip():
+            meta["meal_type"] = meal_type.strip()
+
+    # --- transport
     if category == "transport":
         if transport_type.strip():
             meta["transport_type"] = transport_type.strip()
@@ -417,36 +454,30 @@ def add_item(
         if transport_link.strip():
             meta["ticket_url"] = transport_link.strip()
         meta["is_car_rental"] = bool(is_car_rental)
-        if car_daily.strip():
-            meta["car_daily"] = car_daily.strip()
-        if car_days.strip():
-            meta["car_days"] = car_days.strip()
 
-        # se for aluguel, custo pode ser calculado (car_daily * car_days) se custo vazio
-        if (not parsed_cost) and car_daily.strip() and car_days.strip():
+        if bool(is_car_rental) and car_daily.strip() and car_days.strip() and (not cost.strip()):
             try:
-                cd = parse_money_to_float(car_daily)
-                nd = int(car_days.strip())
-                if cd is not None and nd > 0:
-                    parsed_cost = cd * nd
+                cd = parse_money_to_float(car_daily.strip()) or 0.0
+                days = int(car_days.strip())
+                parsed_cost = float(cd * days)
+                meta["car_daily"] = cd
+                meta["car_days"] = days
             except Exception:
                 pass
 
+    # --- título default
     final_title = title.strip()
     if not final_title:
         if category == "activity":
-            final_title = (place.strip() or "Passeio")
+            final_title = "Passeio"
         elif category == "restaurant":
-            final_title = (place.strip() or "Restaurante")
+            final_title = "Restaurante"
         elif category == "hotel":
-            final_title = (place.strip() or "Hospedagem")
+            final_title = "Hospedagem"
         elif category == "flight":
-            if origin.strip() or destination.strip():
-                final_title = f"{origin.strip()} → {destination.strip()}".strip(" →")
-            else:
-                final_title = "Voo"
+            final_title = "Voo"
         elif category == "transport":
-            final_title = transport_type.strip() or "Transporte"
+            final_title = "Transporte"
         else:
             final_title = "Item"
 
@@ -465,6 +496,7 @@ def add_item(
     except Exception:
         return redirect_with_error(token, "Erro ao salvar item. Verifique os campos e tente novamente.")
 
+
 @app.post("/t/{token}/items/{item_id}/delete")
 def remove_item(token: str, item_id: int, db: Session = Depends(get_db)):
     trip = get_trip_by_token(db, token)
@@ -472,6 +504,7 @@ def remove_item(token: str, item_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
     delete_item(db, trip, item_id)
     return RedirectResponse(url=f"/t/{token}", status_code=303)
+
 
 @app.get("/health")
 def health():
