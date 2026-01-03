@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="max-w-2xl mx-auto grid gap-6">
+  <div class="rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+    <h1 class="text-2xl font-semibold tracking-tight">Nova viagem</h1>
+    <p class="mt-2 text-slate-300">Preencha os dados básicos. Depois você adiciona passagens, hotéis e roteiro.</p>
+
+    {% if error %}
+      <div class="mt-4 rounded-2xl border border-rose-900 bg-rose-950/40 p-4 text-rose-200">
+        {{ error }}
+      </div>
+    {% endif %}
+
+    <form method="post" action="/trips/new" class="mt-6 grid gap-4">
+      <div>
+        <label class="text-sm text-slate-300">Título</label>
+        <input name="title" required minlength="2" maxlength="120"
+               placeholder="Ex: Japão 2026"
+               class="mt-1 w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2" />
+      </div>
+
+      <div>
+        <label class="text-sm text-slate-300">Destino</label>
+        <input name="destination" required minlength="2" maxlength="120"
+               placeholder="Ex: Tóquio, Kyoto, Osaka"
+               class="mt-1 w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2" />
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-sm text-slate-300">Início</label>
+          <input name="start_date" type="date" required
+                 class="mt-1 w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2" />
+        </div>
+        <div>
+          <label class="text-sm text-slate-300">Fim</label>
+          <input name="end_date" type="date" required
+                 class="mt-1 w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2" />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-sm text-slate-300">Moeda</label>
+          <select name="currency"
+                  class="mt-1 w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2">
+            <option value="BRL">BRL</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex gap-3 mt-2">
+        <button class="px-4 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 transition font-medium">
+          Criar viagem
+        </button>
+        <a href="/" class="px-4 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 transition font-medium">
+          Voltar
+        </a>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

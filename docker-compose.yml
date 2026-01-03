@@ -1,0 +1,16 @@
+services:
+  trip-planner:
+    build: .
+    container_name: trip-planner
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=Trip Planner
+      - APP_BASE_URL=http://localhost:8000
+      - DB_PATH=/data/app.db
+    volumes:
+      - trip_data:/data
+    restart: unless-stopped
+
+volumes:
+  trip_data:

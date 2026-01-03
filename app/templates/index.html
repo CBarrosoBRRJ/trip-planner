@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid gap-6">
+  <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
+    <h1 class="text-3xl font-semibold tracking-tight">Trip Planner</h1>
+    <p class="mt-2 text-slate-300">
+      Crie uma viagem e compartilhe um link para o grupo organizar passagens, hotéis, roteiro, passeios, tickets e links.
+    </p>
+
+    <div class="mt-6 flex flex-wrap gap-3">
+      <a href="/trips/new" class="px-4 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 transition font-medium">
+        Criar nova viagem
+      </a>
+    </div>
+  </div>
+</div>
+{% endblock %}
