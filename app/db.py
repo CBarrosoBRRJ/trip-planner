@@ -1,30 +1,32 @@
 import os
-from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-BASE_DIR = Path(__file__).resolve().parent  # .../app
-DEFAULT_SQLITE = f"sqlite:///{(BASE_DIR / 'app.db').as_posix()}"
+# Se existir DATABASE_URL, usa Postgres (produção).
+# Se não existir, usa SQLite local (desenvolvimento).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-def _normalize_db_url(url: str) -> str:
-    """
-    Render/Supabase às vezes fornecem 'postgres://' mas SQLAlchemy quer 'postgresql://'
-    """
-    url = (url or "").strip()
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
-
-DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL")) or DEFAULT_SQLITE
+if DATABASE_URL:
+    # Render/Supabase normalmente já vem ok como postgresql://...
+    # SQLAlchemy prefere postgresql+psycopg2://, mas psycopg2 aceita ambos.
+    SQLALCHEMY_DATABASE_URL = DATABASE_URL
+else:
+    # SQLite local (arquivo no projeto)
+    SQLALCHEMY_DATABASE_URL = "sqlite:///./app.db"
 
 connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
+if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, future=True, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()
@@ -33,9 +35,7 @@ def get_db():
     finally:
         db.close()
 
-def ensure_db_ready():
-    """
-    Mantém a lógica simples: cria tabelas (para MVP).
-    Se você quiser migração real depois, a gente coloca Alembic.
-    """
-    Base.metadata.create_all(bind=engine)
+
+def ensure_sqlite_migrations():
+    # Placeholder (se você tinha isso antes). Em Postgres não precisa.
+    return
