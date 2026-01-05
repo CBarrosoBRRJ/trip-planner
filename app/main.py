@@ -3,11 +3,10 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import OperationalError
 
 from .db import Base, engine, get_db, ensure_db_ready
 from .schemas import TripCreate, ItemCreate, ParticipantCreate
@@ -37,75 +36,21 @@ CATEGORY_LABEL = {
     "notes": "Anotações",
 }
 
-# flag global: DB pronto?
-DB_READY = False
-
-
-def warmup_html(request: Request, msg: str = "A aplicação está acordando. Tente novamente em alguns segundos."):
-    """
-    Página 503 amigável: evita erro de servidor na cara do usuário.
-    """
-    return templates.TemplateResponse(
-        "base.html",
-        {
-            "request": request,
-            "content": f"""
-            <div style="max-width:720px;margin:0 auto;padding:32px">
-              <div style="border:1px solid #334155;border-radius:20px;padding:20px;background:rgba(2,6,23,.7)">
-                <h1 style="font-size:20px;font-weight:800;margin:0;color:#e2e8f0">Preparando…</h1>
-                <p style="margin-top:10px;color:#cbd5e1">{msg}</p>
-                <p style="margin-top:10px;color:#94a3b8;font-size:13px">
-                  Se você abriu um link logo depois que o Render “dormiu”, o primeiro acesso pode falhar.
-                  Seus dados ficam salvos no Postgres.
-                </p>
-                <p style="margin-top:16px;color:#94a3b8;font-size:13px">Recarregando automaticamente…</p>
-              </div>
-            </div>
-            <script>
-              setTimeout(()=>location.reload(), 3500);
-            </script>
-            """,
-        },
-        status_code=503,
-    )
-
+# --------------------------------------------
+# STARTUP: tenta DB, mas NÃO derruba o server
+# --------------------------------------------
+DB_OK = False
 
 @app.on_event("startup")
 def _startup():
-    """
-    Startup resiliente:
-    - tenta preparar DB
-    - se falhar, NÃO derruba app (Render cold start)
-    """
-    global DB_READY
+    global DB_OK
     try:
-        ensure_db_ready(max_wait_seconds=60)
+        ensure_db_ready(max_wait_seconds=40)
         Base.metadata.create_all(bind=engine)
-        DB_READY = True
+        DB_OK = True
     except Exception:
-        # não derruba o server; ele sobe e responde 503 até DB ficar OK
-        DB_READY = False
-
-
-@app.middleware("http")
-async def db_resilience_middleware(request: Request, call_next):
-    """
-    Se DB caiu/está acordando, evitamos 500 e entregamos 503 amigável.
-    Também tenta religar DB_READY quando voltar.
-    """
-    global DB_READY
-    try:
-        response = await call_next(request)
-        return response
-    except OperationalError:
-        # tenta marcar como não pronto e responder 503
-        DB_READY = False
-        return warmup_html(request, "Banco ainda não respondeu. Aguarde alguns segundos…")
-    except Exception as e:
-        # se for rota que depende de DB e DB não está pronto, devolve 503 em vez de 500
-        if not DB_READY:
-            return warmup_html(request, "Serviço ainda está iniciando. Aguarde alguns segundos…")
-        raise e
+        # não derruba a app; a UI vai mostrar 503 amigável
+        DB_OK = False
 
 
 def parse_yyyy_mm_dd(value: str, field: str):
@@ -164,37 +109,76 @@ def enforce_date_in_trip(trip, dt, label: str):
         )
 
 
-# ====== Rotas raiz / health com HEAD ======
+def db_gate_or_503(request: Request):
+    """
+    Se DB ainda não estiver OK (cold start), devolve 503 amigável com auto-retry.
+    """
+    if DB_OK:
+        return None
 
+    # página simples, sem depender de db
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <title>Preparando...</title>
+      <style>
+        body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0b1220; color:#e2e8f0; margin:0; }}
+        .wrap {{ max-width: 760px; margin: 8vh auto; padding: 24px; }}
+        .card {{ background: rgba(15,23,42,.7); border:1px solid #1e293b; border-radius: 18px; padding: 20px; }}
+        .muted {{ color:#94a3b8; }}
+        .pill {{ display:inline-block; padding:6px 10px; border-radius:9999px; border:1px solid #334155; background:#020617; }}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <h1 style="margin:0 0 10px 0;">Preparando o servidor…</h1>
+          <p class="muted" style="margin:0 0 14px 0;">
+            O Render acordou a instância agora e o banco ainda está conectando.
+            Esta página vai tentar novamente automaticamente.
+          </p>
+          <p class="muted"><span class="pill">URL:</span> {request.url}</p>
+        </div>
+      </div>
+      <script>
+        setTimeout(() => window.location.reload(), 2500);
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html, status_code=503)
+
+
+# -------------------------
+# Routes básicas
+# -------------------------
 @app.get("/", response_class=HTMLResponse)
 def root():
     return RedirectResponse(url="/t/new", status_code=302)
 
 @app.head("/")
-def root_head():
-    return PlainTextResponse("ok", status_code=200)
+def head_root():
+    return HTMLResponse("", status_code=200)
 
 @app.get("/health")
 def health():
-    # tenta ligar DB_READY se recuperou
-    global DB_READY
-    if not DB_READY:
-        try:
-            ensure_db_ready(max_wait_seconds=3, sleep_seconds=1.0)
-            DB_READY = True
-        except Exception:
-            pass
-    return JSONResponse({"status": "ok", "db_ready": DB_READY})
+    # Se DB_OK false, ainda retorna 200 mas avisa
+    return JSONResponse({"status": "ok", "db_ready": bool(DB_OK)})
 
 @app.head("/health")
-def health_head():
-    return PlainTextResponse("ok", status_code=200)
+def head_health():
+    return HTMLResponse("", status_code=200)
 
-
-# ====== Páginas ======
 
 @app.get("/t/new", response_class=HTMLResponse)
 def trip_new_page(request: Request):
+    gate = db_gate_or_503(request)
+    if gate:
+        return gate
+
     return templates.TemplateResponse(
         "trip_onepage.html",
         {
@@ -228,10 +212,9 @@ def trip_create_submit(
     currency: str = Form("BRL"),
     db: Session = Depends(get_db),
 ):
-    # Se DB não está pronto, devolve 503 "acordando" em vez de 500
-    global DB_READY
-    if not DB_READY:
-        return warmup_html(request, "Banco ainda está iniciando. Recarregue em alguns segundos…")
+    gate = db_gate_or_503(request)
+    if gate:
+        return gate
 
     try:
         start_dt = parse_yyyy_mm_dd(start_date, "Início")
@@ -287,9 +270,9 @@ def trip_create_submit(
 
 @app.get("/t/{token}", response_class=HTMLResponse)
 def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
-    global DB_READY
-    if not DB_READY:
-        return warmup_html(request, "Acordando o banco para abrir a viagem…")
+    gate = db_gate_or_503(request)
+    if gate:
+        return gate
 
     trip = get_trip_by_token(db, token)
     if not trip:
