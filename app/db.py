@@ -1,85 +1,511 @@
-import os
-import time
-from pathlib import Path
+from collections import defaultdict
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, quote
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
+from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
 
-Base = declarative_base()
+from .db import Base, engine, get_db, ensure_db_ready
+from .schemas import TripCreate, ItemCreate, ParticipantCreate
+from .services import (
+    create_trip,
+    get_trip_by_token,
+    create_item,
+    delete_item,
+    add_participant,
+    remove_participant,
+    cents_to_money,
+    meta_from_json,
+)
 
+app = FastAPI(title="Trip Planner")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
 
-def _normalize_db_url(url: str) -> str:
-    """
-    Render/Supabase às vezes entregam DATABASE_URL com prefixo postgres://
-    SQLAlchemy prefere postgresql://
-    """
-    if not url:
-        return ""
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
-
-
-def _sqlite_url_from_env() -> str:
-    """
-    Fallback local (Windows / Docker) quando não existir DATABASE_URL.
-    Usa DB_PATH se existir; senão cria em ./data/app.db
-    """
-    db_path = os.getenv("DB_PATH", "").strip()
-    if db_path:
-        p = Path(db_path)
-    else:
-        p = Path("data") / "app.db"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # sqlite URL precisa de path absoluto em alguns ambientes
-    return f"sqlite:///{p.resolve().as_posix()}"
-
-
-DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", "").strip())
-
-if DATABASE_URL:
-    # Postgres (Render/Supabase)
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
-        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
-    )
-else:
-    # SQLite local
-    engine = create_engine(
-        _sqlite_url_from_env(),
-        connect_args={"check_same_thread": False},
-        pool_pre_ping=True,
-    )
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+CATEGORY_LABEL = {
+    "activity": "Passeios",
+    "restaurant": "Restaurantes",
+    "hotel": "Hospedagens",
+    "flight": "Passagens",
+    "transport": "Transporte",
+    "ticket": "Tickets",
+    "reference": "Links",
+    "notes": "Anotações",
+}
 
 
-def get_db():
-    db = SessionLocal()
+@app.on_event("startup")
+def _startup():
+    # garante DB pronto no Render/Supabase
+    ensure_db_ready(max_wait_seconds=40)
+    # cria tabelas (para projeto simples, sem migrations)
+    Base.metadata.create_all(bind=engine)
+
+
+def parse_yyyy_mm_dd(value: str, field: str):
     try:
-        yield db
-    finally:
-        db.close()
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Data inválida em {field}. Use YYYY-MM-DD.")
 
 
-def ensure_db_ready(max_wait_seconds: int = 30) -> None:
-    """
-    Em cloud, o Postgres pode demorar alguns segundos para aceitar conexão.
-    Esta função tenta pingar o DB (SELECT 1) até passar ou estourar timeout.
-    """
-    start = time.time()
-    last_err = None
+def parse_money_to_float(value: str):
+    if value is None:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    s = s.replace(" ", "")
+    if any(c.isalpha() for c in s):
+        raise ValueError("Valor inválido. Use apenas números (ex: 120 ou 120,50).")
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        if "," in s:
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        raise ValueError("Valor inválido. Use apenas números (ex: 120 ou 120,50).")
 
-    while time.time() - start < max_wait_seconds:
+
+def build_google_calendar_link(title: str, destination: str, start_date, end_date, details_url: str):
+    dates = f"{start_date.strftime('%Y%m%d')}/{end_date.strftime('%Y%m%d')}"
+    params = {
+        "action": "TEMPLATE",
+        "text": f"{title} - {destination}",
+        "dates": dates,
+        "details": f"Planejamento: {details_url}",
+    }
+    return "https://calendar.google.com/calendar/render?" + urlencode(params)
+
+
+def redirect_with_error(token: str, msg: str):
+    return RedirectResponse(url=f"/t/{token}?error={quote(msg)}", status_code=303)
+
+
+def enforce_date_in_trip(trip, dt, label: str):
+    if dt is None:
+        return
+    if dt < trip.start_date or dt > trip.end_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} fora do período da viagem ({trip.start_date} → {trip.end_date}).",
+        )
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return RedirectResponse(url="/t/new", status_code=302)
+
+
+@app.get("/t/new", response_class=HTMLResponse)
+def trip_new_page(request: Request):
+    return templates.TemplateResponse(
+        "trip_onepage.html",
+        {
+            "request": request,
+            "mode": "create",
+            "trip": None,
+            "share_url": None,
+            "gcal_url": None,
+            "groups": {},
+            "by_day": {},
+            "days_sorted": [],
+            "participants": [],
+            "category_label": CATEGORY_LABEL,
+            "cents_to_money": cents_to_money,
+            "total_by_cat": {},
+            "total_all": 0,
+            "per_person": 0,
+            "error": None,
+        },
+    )
+
+
+@app.post("/t/new")
+def trip_create_submit(
+    request: Request,
+    title: str = Form(...),
+    destination: str = Form(...),
+    start_date: str = Form(...),
+    duration_days: str = Form(""),
+    end_date: str = Form(""),
+    currency: str = Form("BRL"),
+    db: Session = Depends(get_db),
+):
+    try:
+        start_dt = parse_yyyy_mm_dd(start_date, "Início")
+
+        end_dt = None
+        if end_date and end_date.strip():
+            end_dt = parse_yyyy_mm_dd(end_date, "Fim")
+        else:
+            if duration_days and duration_days.strip():
+                d = int(duration_days.strip())
+                if d <= 0 or d > 365:
+                    raise HTTPException(status_code=400, detail="Duração inválida (use 1 a 365 dias).")
+                end_dt = start_dt + timedelta(days=d - 1)
+            else:
+                raise HTTPException(status_code=400, detail="Informe o fim ou a duração da viagem.")
+
+        if end_dt < start_dt:
+            raise HTTPException(status_code=400, detail="Fim não pode ser antes do início.")
+
+        payload = TripCreate(
+            title=title,
+            destination=destination,
+            start_date=start_dt,
+            end_date=end_dt,
+            currency=currency,
+        )
+        trip = create_trip(db, payload)
+        return RedirectResponse(url=f"/t/{trip.token}", status_code=303)
+
+    except HTTPException as e:
+        return templates.TemplateResponse(
+            "trip_onepage.html",
+            {
+                "request": request,
+                "mode": "create",
+                "trip": None,
+                "share_url": None,
+                "gcal_url": None,
+                "groups": {},
+                "by_day": {},
+                "days_sorted": [],
+                "participants": [],
+                "category_label": CATEGORY_LABEL,
+                "cents_to_money": cents_to_money,
+                "total_by_cat": {},
+                "total_all": 0,
+                "per_person": 0,
+                "error": e.detail,
+            },
+            status_code=e.status_code,
+        )
+
+
+@app.get("/t/{token}", response_class=HTMLResponse)
+def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+
+    base = str(request.base_url).rstrip("/")
+    share_url = f"{base}/t/{trip.token}"
+    gcal_url = build_google_calendar_link(trip.title, trip.destination, trip.start_date, trip.end_date, share_url)
+    error = request.query_params.get("error")
+
+    groups = defaultdict(list)
+    total_by_cat = defaultdict(int)
+    total_all = 0
+
+    for item in trip.items:
+        meta = meta_from_json(getattr(item, "meta_json", None))
+        item._meta = meta
+        groups[item.category].append(item)
+
+        if item.cost is not None:
+            total_by_cat[item.category] += item.cost
+            total_all += item.cost
+
+    for cat in list(groups.keys()):
+        groups[cat].sort(key=lambda x: (x.item_date is None, x.item_date, x.created_at))
+
+    # por dia (apenas activities para o painel premium)
+    by_day = defaultdict(list)
+    for it in groups.get("activity", []):
+        if it.item_date:
+            by_day[it.item_date].append(it)
+    for d in list(by_day.keys()):
+        by_day[d].sort(key=lambda x: (x._meta.get("time", ""), x.created_at))
+    days_sorted = sorted(by_day.keys())
+
+    participants = sorted(trip.participants, key=lambda p: p.created_at)
+    people = max(1, len(participants))
+    per_person = int(round(total_all / people)) if total_all else 0
+
+    return templates.TemplateResponse(
+        "trip_onepage.html",
+        {
+            "request": request,
+            "mode": "view",
+            "trip": trip,
+            "share_url": share_url,
+            "gcal_url": gcal_url,
+            "groups": groups,
+            "by_day": by_day,
+            "days_sorted": days_sorted,
+            "participants": participants,
+            "category_label": CATEGORY_LABEL,
+            "cents_to_money": cents_to_money,
+            "total_by_cat": total_by_cat,
+            "total_all": total_all,
+            "per_person": per_person,
+            "error": error,
+        },
+    )
+
+
+@app.post("/t/{token}/edit")
+def edit_trip(
+    token: str,
+    title: str = Form(...),
+    destination: str = Form(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    currency: str = Form("BRL"),
+    db: Session = Depends(get_db),
+):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+
+    try:
+        sd = parse_yyyy_mm_dd(start_date, "Início")
+        ed = parse_yyyy_mm_dd(end_date, "Fim")
+        if ed < sd:
+            return redirect_with_error(token, "Fim não pode ser antes do início.")
+        trip.title = title.strip()
+        trip.destination = destination.strip()
+        trip.start_date = sd
+        trip.end_date = ed
+        trip.currency = (currency or "BRL").strip().upper()
+        db.commit()
+        return RedirectResponse(url=f"/t/{token}", status_code=303)
+    except HTTPException as e:
+        return redirect_with_error(token, str(e.detail))
+
+
+@app.post("/t/{token}/join")
+def join_trip(token: str, name: str = Form(...), email: str = Form(""), db: Session = Depends(get_db)):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+    payload = ParticipantCreate(name=name, email=email or None)
+    add_participant(db, trip, payload)
+    return RedirectResponse(url=f"/t/{token}", status_code=303)
+
+
+@app.post("/t/{token}/participants/{participant_id}/delete")
+def delete_participant(token: str, participant_id: int, db: Session = Depends(get_db)):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+    remove_participant(db, trip, participant_id)
+    return RedirectResponse(url=f"/t/{token}", status_code=303)
+
+
+@app.post("/t/{token}/items")
+def add_item(
+    token: str,
+    category: str = Form(...),
+
+    title: str = Form(""),
+    item_date: str = Form(""),
+    url: str = Form(""),
+    cost: str = Form(""),
+
+    # campos genéricos usados por várias categorias
+    address: str = Form(""),
+    notes: str = Form(""),
+
+    # activity
+    period: str = Form(""),
+    is_free: str = Form(""),
+    ticket_url: str = Form(""),
+
+    # flight
+    time_str: str = Form(""),
+    company: str = Form(""),
+    origin: str = Form(""),
+    destination: str = Form(""),
+    flight_duration: str = Form(""),
+    has_connection: str = Form(""),
+    connection_place: str = Form(""),
+    connection_duration: str = Form(""),
+
+    # hotel
+    checkin_date: str = Form(""),
+    hotel_type: str = Form(""),
+    nights: str = Form(""),
+    daily_value: str = Form(""),
+
+    # restaurant
+    planned_date: str = Form(""),
+    meal_type: str = Form(""),
+
+    # transport
+    transport_type: str = Form(""),
+    transport_date: str = Form(""),
+    transport_duration: str = Form(""),
+    is_car_rental: str = Form(""),
+    car_daily: str = Form(""),
+    car_days: str = Form(""),
+    transport_link: str = Form(""),
+
+    db: Session = Depends(get_db),
+):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+
+    # --- Data (cada categoria pode mandar em campo diferente)
+    date_raw = (item_date or "").strip()
+    if category == "hotel" and checkin_date.strip():
+        date_raw = checkin_date.strip()
+    if category == "restaurant" and planned_date.strip():
+        date_raw = planned_date.strip()
+    if category == "transport" and transport_date.strip():
+        date_raw = transport_date.strip()
+
+    parsed_item_date = None
+    if date_raw:
         try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            return
-        except Exception as e:
-            last_err = e
-            time.sleep(1)
+            parsed_item_date = parse_yyyy_mm_dd(date_raw, "Data")
+            enforce_date_in_trip(trip, parsed_item_date, "Data")
+        except HTTPException as e:
+            return redirect_with_error(token, str(e.detail))
 
-    # se chegou aqui, falhou
-    raise RuntimeError(f"Banco não ficou pronto em {max_wait_seconds}s. Erro: {last_err}")
+    # --- Custo (float) -> centavos no service
+    parsed_cost = None
+    if cost.strip():
+        try:
+            parsed_cost = parse_money_to_float(cost)
+        except ValueError as ve:
+            return redirect_with_error(token, str(ve))
+
+    meta = {}
+
+    # campos gerais
+    if address.strip():
+        meta["address"] = address.strip()
+    if notes.strip():
+        meta["notes"] = notes.strip()
+    if url.strip():
+        meta["url"] = url.strip()
+
+    # --- activity
+    if category == "activity":
+        if period.strip():
+            meta["period"] = period.strip()
+        meta["is_free"] = bool(is_free)
+        if ticket_url.strip():
+            meta["ticket_url"] = ticket_url.strip()
+
+        # se for gratuito, zera custo
+        if meta.get("is_free"):
+            parsed_cost = None
+
+    # --- flight
+    if category == "flight":
+        if time_str.strip():
+            meta["time"] = time_str.strip()
+        if company.strip():
+            meta["company"] = company.strip()
+        if origin.strip():
+            meta["origin"] = origin.strip()
+        if destination.strip():
+            meta["destination"] = destination.strip()
+        if flight_duration.strip():
+            meta["duration"] = flight_duration.strip()
+        meta["has_connection"] = bool(has_connection)
+        if connection_place.strip():
+            meta["connection_place"] = connection_place.strip()
+        if connection_duration.strip():
+            meta["connection_duration"] = connection_duration.strip()
+
+    # --- hotel
+    if category == "hotel":
+        if hotel_type.strip():
+            meta["hotel_type"] = hotel_type.strip()
+        if nights.strip():
+            meta["nights"] = nights.strip()
+        if daily_value.strip():
+            meta["daily_value"] = daily_value.strip()
+        # cálculo do custo total (noites * diária) se o usuário não informou cost
+        if (not cost.strip()) and nights.strip() and daily_value.strip():
+            try:
+                n = int(nights.strip())
+                dv = parse_money_to_float(daily_value.strip()) or 0.0
+                parsed_cost = float(n * dv)
+            except Exception:
+                pass
+
+    # --- restaurant
+    if category == "restaurant":
+        if meal_type.strip():
+            meta["meal_type"] = meal_type.strip()
+
+    # --- transport
+    if category == "transport":
+        if transport_type.strip():
+            meta["transport_type"] = transport_type.strip()
+        if transport_duration.strip():
+            meta["duration"] = transport_duration.strip()
+        if transport_link.strip():
+            meta["ticket_url"] = transport_link.strip()
+        meta["is_car_rental"] = bool(is_car_rental)
+
+        if bool(is_car_rental) and car_daily.strip() and car_days.strip() and (not cost.strip()):
+            try:
+                cd = parse_money_to_float(car_daily.strip()) or 0.0
+                days = int(car_days.strip())
+                parsed_cost = float(cd * days)
+                meta["car_daily"] = cd
+                meta["car_days"] = days
+            except Exception:
+                pass
+
+    # --- título default
+    final_title = title.strip()
+    if not final_title:
+        if category == "activity":
+            final_title = "Passeio"
+        elif category == "restaurant":
+            final_title = "Restaurante"
+        elif category == "hotel":
+            final_title = "Hospedagem"
+        elif category == "flight":
+            final_title = "Voo"
+        elif category == "transport":
+            final_title = "Transporte"
+        else:
+            final_title = "Item"
+
+    try:
+        payload = ItemCreate(
+            category=category,
+            title=final_title,
+            item_date=parsed_item_date,
+            url=url.strip() or None,
+            cost=parsed_cost,
+            notes=None,
+            meta=meta or None,
+        )
+        create_item(db, trip, payload)
+        return RedirectResponse(url=f"/t/{token}", status_code=303)
+    except Exception:
+        return redirect_with_error(token, "Erro ao salvar item. Verifique os campos e tente novamente.")
+
+
+@app.post("/t/{token}/items/{item_id}/delete")
+def remove_item(token: str, item_id: int, db: Session = Depends(get_db)):
+    trip = get_trip_by_token(db, token)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+    delete_item(db, trip, item_id)
+    return RedirectResponse(url=f"/t/{token}", status_code=303)
+
+
+@app.get("/health")
+def health():
+    return JSONResponse({"status": "ok"})

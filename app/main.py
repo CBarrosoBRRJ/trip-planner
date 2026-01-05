@@ -3,10 +3,11 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from .db import Base, engine, get_db, ensure_db_ready
 from .schemas import TripCreate, ItemCreate, ParticipantCreate
@@ -36,13 +37,75 @@ CATEGORY_LABEL = {
     "notes": "Anotações",
 }
 
+# flag global: DB pronto?
+DB_READY = False
+
+
+def warmup_html(request: Request, msg: str = "A aplicação está acordando. Tente novamente em alguns segundos."):
+    """
+    Página 503 amigável: evita erro de servidor na cara do usuário.
+    """
+    return templates.TemplateResponse(
+        "base.html",
+        {
+            "request": request,
+            "content": f"""
+            <div style="max-width:720px;margin:0 auto;padding:32px">
+              <div style="border:1px solid #334155;border-radius:20px;padding:20px;background:rgba(2,6,23,.7)">
+                <h1 style="font-size:20px;font-weight:800;margin:0;color:#e2e8f0">Preparando…</h1>
+                <p style="margin-top:10px;color:#cbd5e1">{msg}</p>
+                <p style="margin-top:10px;color:#94a3b8;font-size:13px">
+                  Se você abriu um link logo depois que o Render “dormiu”, o primeiro acesso pode falhar.
+                  Seus dados ficam salvos no Postgres.
+                </p>
+                <p style="margin-top:16px;color:#94a3b8;font-size:13px">Recarregando automaticamente…</p>
+              </div>
+            </div>
+            <script>
+              setTimeout(()=>location.reload(), 3500);
+            </script>
+            """,
+        },
+        status_code=503,
+    )
+
 
 @app.on_event("startup")
 def _startup():
-    # garante DB pronto no Render/Supabase
-    ensure_db_ready(max_wait_seconds=40)
-    # cria tabelas (para projeto simples, sem migrations)
-    Base.metadata.create_all(bind=engine)
+    """
+    Startup resiliente:
+    - tenta preparar DB
+    - se falhar, NÃO derruba app (Render cold start)
+    """
+    global DB_READY
+    try:
+        ensure_db_ready(max_wait_seconds=60)
+        Base.metadata.create_all(bind=engine)
+        DB_READY = True
+    except Exception:
+        # não derruba o server; ele sobe e responde 503 até DB ficar OK
+        DB_READY = False
+
+
+@app.middleware("http")
+async def db_resilience_middleware(request: Request, call_next):
+    """
+    Se DB caiu/está acordando, evitamos 500 e entregamos 503 amigável.
+    Também tenta religar DB_READY quando voltar.
+    """
+    global DB_READY
+    try:
+        response = await call_next(request)
+        return response
+    except OperationalError:
+        # tenta marcar como não pronto e responder 503
+        DB_READY = False
+        return warmup_html(request, "Banco ainda não respondeu. Aguarde alguns segundos…")
+    except Exception as e:
+        # se for rota que depende de DB e DB não está pronto, devolve 503 em vez de 500
+        if not DB_READY:
+            return warmup_html(request, "Serviço ainda está iniciando. Aguarde alguns segundos…")
+        raise e
 
 
 def parse_yyyy_mm_dd(value: str, field: str):
@@ -101,10 +164,34 @@ def enforce_date_in_trip(trip, dt, label: str):
         )
 
 
+# ====== Rotas raiz / health com HEAD ======
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return RedirectResponse(url="/t/new", status_code=302)
 
+@app.head("/")
+def root_head():
+    return PlainTextResponse("ok", status_code=200)
+
+@app.get("/health")
+def health():
+    # tenta ligar DB_READY se recuperou
+    global DB_READY
+    if not DB_READY:
+        try:
+            ensure_db_ready(max_wait_seconds=3, sleep_seconds=1.0)
+            DB_READY = True
+        except Exception:
+            pass
+    return JSONResponse({"status": "ok", "db_ready": DB_READY})
+
+@app.head("/health")
+def health_head():
+    return PlainTextResponse("ok", status_code=200)
+
+
+# ====== Páginas ======
 
 @app.get("/t/new", response_class=HTMLResponse)
 def trip_new_page(request: Request):
@@ -141,6 +228,11 @@ def trip_create_submit(
     currency: str = Form("BRL"),
     db: Session = Depends(get_db),
 ):
+    # Se DB não está pronto, devolve 503 "acordando" em vez de 500
+    global DB_READY
+    if not DB_READY:
+        return warmup_html(request, "Banco ainda está iniciando. Recarregue em alguns segundos…")
+
     try:
         start_dt = parse_yyyy_mm_dd(start_date, "Início")
 
@@ -195,6 +287,10 @@ def trip_create_submit(
 
 @app.get("/t/{token}", response_class=HTMLResponse)
 def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
+    global DB_READY
+    if not DB_READY:
+        return warmup_html(request, "Acordando o banco para abrir a viagem…")
+
     trip = get_trip_by_token(db, token)
     if not trip:
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
@@ -220,7 +316,6 @@ def trip_page(token: str, request: Request, db: Session = Depends(get_db)):
     for cat in list(groups.keys()):
         groups[cat].sort(key=lambda x: (x.item_date is None, x.item_date, x.created_at))
 
-    # por dia (apenas activities para o painel premium)
     by_day = defaultdict(list)
     for it in groups.get("activity", []):
         if it.item_date:
@@ -314,16 +409,13 @@ def add_item(
     url: str = Form(""),
     cost: str = Form(""),
 
-    # campos genéricos usados por várias categorias
     address: str = Form(""),
     notes: str = Form(""),
 
-    # activity
     period: str = Form(""),
     is_free: str = Form(""),
     ticket_url: str = Form(""),
 
-    # flight
     time_str: str = Form(""),
     company: str = Form(""),
     origin: str = Form(""),
@@ -333,17 +425,14 @@ def add_item(
     connection_place: str = Form(""),
     connection_duration: str = Form(""),
 
-    # hotel
     checkin_date: str = Form(""),
     hotel_type: str = Form(""),
     nights: str = Form(""),
     daily_value: str = Form(""),
 
-    # restaurant
     planned_date: str = Form(""),
     meal_type: str = Form(""),
 
-    # transport
     transport_type: str = Form(""),
     transport_date: str = Form(""),
     transport_duration: str = Form(""),
@@ -358,7 +447,6 @@ def add_item(
     if not trip:
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
 
-    # --- Data (cada categoria pode mandar em campo diferente)
     date_raw = (item_date or "").strip()
     if category == "hotel" and checkin_date.strip():
         date_raw = checkin_date.strip()
@@ -375,7 +463,6 @@ def add_item(
         except HTTPException as e:
             return redirect_with_error(token, str(e.detail))
 
-    # --- Custo (float) -> centavos no service
     parsed_cost = None
     if cost.strip():
         try:
@@ -384,8 +471,6 @@ def add_item(
             return redirect_with_error(token, str(ve))
 
     meta = {}
-
-    # campos gerais
     if address.strip():
         meta["address"] = address.strip()
     if notes.strip():
@@ -393,19 +478,15 @@ def add_item(
     if url.strip():
         meta["url"] = url.strip()
 
-    # --- activity
     if category == "activity":
         if period.strip():
             meta["period"] = period.strip()
         meta["is_free"] = bool(is_free)
         if ticket_url.strip():
             meta["ticket_url"] = ticket_url.strip()
-
-        # se for gratuito, zera custo
         if meta.get("is_free"):
             parsed_cost = None
 
-    # --- flight
     if category == "flight":
         if time_str.strip():
             meta["time"] = time_str.strip()
@@ -423,7 +504,6 @@ def add_item(
         if connection_duration.strip():
             meta["connection_duration"] = connection_duration.strip()
 
-    # --- hotel
     if category == "hotel":
         if hotel_type.strip():
             meta["hotel_type"] = hotel_type.strip()
@@ -431,7 +511,6 @@ def add_item(
             meta["nights"] = nights.strip()
         if daily_value.strip():
             meta["daily_value"] = daily_value.strip()
-        # cálculo do custo total (noites * diária) se o usuário não informou cost
         if (not cost.strip()) and nights.strip() and daily_value.strip():
             try:
                 n = int(nights.strip())
@@ -440,12 +519,10 @@ def add_item(
             except Exception:
                 pass
 
-    # --- restaurant
     if category == "restaurant":
         if meal_type.strip():
             meta["meal_type"] = meal_type.strip()
 
-    # --- transport
     if category == "transport":
         if transport_type.strip():
             meta["transport_type"] = transport_type.strip()
@@ -465,21 +542,15 @@ def add_item(
             except Exception:
                 pass
 
-    # --- título default
     final_title = title.strip()
     if not final_title:
-        if category == "activity":
-            final_title = "Passeio"
-        elif category == "restaurant":
-            final_title = "Restaurante"
-        elif category == "hotel":
-            final_title = "Hospedagem"
-        elif category == "flight":
-            final_title = "Voo"
-        elif category == "transport":
-            final_title = "Transporte"
-        else:
-            final_title = "Item"
+        final_title = {
+            "activity": "Passeio",
+            "restaurant": "Restaurante",
+            "hotel": "Hospedagem",
+            "flight": "Voo",
+            "transport": "Transporte",
+        }.get(category, "Item")
 
     try:
         payload = ItemCreate(
@@ -504,8 +575,3 @@ def remove_item(token: str, item_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Viagem não encontrada")
     delete_item(db, trip, item_id)
     return RedirectResponse(url=f"/t/{token}", status_code=303)
-
-
-@app.get("/health")
-def health():
-    return JSONResponse({"status": "ok"})

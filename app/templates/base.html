@@ -15,6 +15,61 @@
 </head>
 <body>
 
+  <!-- ✅ OVERLAY: evita sensação de "erro" no wake-up do Render -->
+  <div id="coldStartOverlay" class="fixed inset-0 z-[9999] hidden items-center justify-center p-6 bg-slate-950/90 backdrop-blur">
+    <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-900/40 p-5 shadow-xl">
+      <div class="flex items-center gap-3">
+        <div class="h-10 w-10 rounded-2xl bg-indigo-600 grid place-items-center font-black">TP</div>
+        <div class="min-w-0">
+          <div class="font-extrabold text-lg leading-tight">Preparando…</div>
+          <div class="text-sm text-slate-300 leading-tight">
+            Se o Render estava em repouso, o primeiro acesso pode demorar alguns segundos.
+          </div>
+        </div>
+      </div>
+      <div class="mt-3 text-sm text-slate-400">
+        Seus dados ficam salvos no banco. Se aparecer erro, aguarde e recarregue.
+      </div>
+
+      <div class="mt-4 flex items-center gap-3">
+        <div class="h-2 w-2 rounded-full bg-indigo-500 animate-pulse"></div>
+        <div class="text-xs text-slate-400">
+          Carregando página…
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const overlay = document.getElementById("coldStartOverlay");
+      if (!overlay) return;
+
+      // Só faz sentido mostrar em páginas de viagem (view/edit), não no /t/new
+      const path = (location.pathname || "");
+      const shouldShow = path.startsWith("/t/") && path !== "/t/new";
+      if (!shouldShow) return;
+
+      // Mostra rápido (evita "tela branca" em cold start)
+      overlay.classList.remove("hidden");
+      overlay.classList.add("flex");
+
+      // Quando carregar, some
+      function hide() {
+        overlay.classList.add("hidden");
+        overlay.classList.remove("flex");
+      }
+      window.addEventListener("load", hide, { once: true });
+
+      // Fallback: se já carregou, não fica preso
+      setTimeout(function () {
+        if (document.readyState === "complete") hide();
+      }, 1200);
+
+      // Extra: se o backend responder 503 e recarregar, deixa overlay visível (não some)
+    })();
+  </script>
+
   <header class="border-b border-slate-800 bg-slate-950/70 backdrop-blur">
     <div class="container-max py-4 flex items-center justify-between gap-3">
       <a class="flex items-center gap-2 min-w-0" href="/t/new">
